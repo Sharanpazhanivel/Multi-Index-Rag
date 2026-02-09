@@ -1,0 +1,21 @@
+# Discrete router actions for Phase 2/3
+# id: integer action id
+# retrievers: list of retriever keys to use
+# description: for logs/ablations
+
+actions:
+  - id: 0
+    retrievers: [general]
+    description: BM25 only
+  - id: 1
+    retrievers: [technical]
+    description: vector only
+  - id: 2
+    retrievers: [structured]
+    description: SQL only
+  - id: 3
+    retrievers: [technical, general]
+    description: vector + BM25
+  - id: 4
+    retrievers: [code, technical]
+    description: code index + vector

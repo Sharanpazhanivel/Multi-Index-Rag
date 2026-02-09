@@ -1,0 +1,22 @@
+# Index definitions for Phase 0
+# name: display name for logs
+# type: bm25 | vector | sql | code
+# config: type-specific settings
+
+indexes:
+  general:
+    name: General docs (BM25)
+    type: bm25
+    config: {}
+  technical:
+    name: Technical PDFs (vector)
+    type: vector
+    config: {}
+  structured:
+    name: Structured data (SQL)
+    type: sql
+    config: {}
+  code:
+    name: Code snippets (code vector)
+    type: code
+    config: {}

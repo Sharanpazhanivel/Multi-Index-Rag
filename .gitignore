@@ -1,0 +1,36 @@
+# Env and secrets
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.eggs/
+*.egg-info/
+.venv/
+venv/
+
+# Data (keep structure, ignore large files)
+data/raw/*
+data/processed/*
+data/labels/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/labels/.gitkeep
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.bin
+*.ckpt
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
