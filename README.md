@@ -1,14 +1,21 @@
-# Multi-Index RAG with Learned Router
+# Multi-Index RAG with Learned & Bandit Router
 
-Multi-index RAG system where a router chooses, per query, which retrievers and settings to use (vector, BM25, SQL, code index) to maximize answer quality under latency/cost constraints.
+Multi-index RAG system where a router chooses, **per query**, which retrievers and settings to use (vector, BM25, SQL, code index) to balance **answer quality**, **latency**, and **cost**.
+
+This repo contains a full research-style pipeline:
+
+- **Multiple retrievers** (BM25, dense/vector, SQL, code)
+- **Router evolution**: rules → supervised transformer → bandit / RL
+- **End-to-end logging & feedback** for learning from usage
+- **Evaluation & ablations** across different routing strategies
 
 ---
 
-## What’s ## How it works
+## 1. High-level architecture
 
-### End-to-end: query to answer
+### 1.1 End-to-end: query → answer
 
-```
+```text
     [User query]
             |
             v
@@ -28,20 +35,20 @@ Multi-index RAG system where a router chooses, per query, which retrievers and s
      \      +-------+-------+------+
       \             |
        \            v
-        \    [Re-rank RRF]
+        \    [Re-rank (RRF)]
          \          |
           \         v
-           \   [Answer stub]
+           \    [LLM answer]
             \________|
 ```
 
-### Router evolution (Phase 1 to 2 to 3)
+### 1.2 Router evolution (Phase 1 → 2 → 3)
 
-```
+```text
   Phase 1: Rules
   +------------------+
-  | Keyword / regex   |----+
-  | Centroid similarity |--+
+  | Keyword / regex  |----+
+  | Centroid sim     |--+
   +------------------+  |
             |           v
             v    [Combined rules router]
@@ -61,15 +68,15 @@ Multi-index RAG system where a router chooses, per query, which retrievers and s
   Phase 3: Bandit / RL                          |
   +------------------+                          v
   | LinUCB           |----+              Epsilon-greedy (uses LearnedRouter)
-  | Epsilon-greedy   |----+----> [BanditRouter]
-  | REINFORCE        |----+              REINFORCE (uses Checkpoint)
+  | Eps-greedy       |----+----> [BanditRouter]
+  | REINFORCE        |----+              REINFORCE (uses checkpoint)
   | feedback_log     |----+
   +------------------+
 ```
 
-### Data and feedback flow
+### 1.3 Data & feedback flow
 
-```
+```text
   data/raw  -->  data/processed
        |
   data/labels --> queries.jsonl
@@ -91,21 +98,21 @@ Multi-index RAG system where a router chooses, per query, which retrievers and s
   router_log.jsonl  -->  feedback_log.jsonl
                                 |
                                 v
-                         phase3_bandit_online replay
+                         phase3_bandit_online (replay)
                                 |
                                 v
                          checkpoints/router (REINFORCE --save)
 ```
 
-### Single request path (pipeline)
+### 1.4 Single request path (pipeline)
 
-```
+```text
   [Query]
       |
       v
-  Router type? ----+---- Rules -----> [Keyword / Centroid]
-      |            +---- Learned ---> [Transformer, argmax]
-      |            +---- Bandit -----> [LinUCB / Epsilon-greedy / REINFORCE]
+  Router type? ----+---- Rules  ----> [Keyword / Centroid]
+      |            +---- Learned --> [Transformer, argmax]
+      |            +---- Bandit ----> [LinUCB / Eps-greedy / REINFORCE]
       |
       v
   [RouterDecision: action_id, retriever_names]
@@ -124,90 +131,202 @@ Multi-index RAG system where a router chooses, per query, which retrievers and s
       +---------------------------------> [Chunks]
                       |
                       v
-                [LLM stub]
+                [LLM answer]
                       |
                       v
-                [Answer]
-                      |
-                      v
-                (Optional) record_feedback --> feedback_log.jsonl
+            (Optional) record_feedback --> feedback_log.jsonl
 ```
 
 ---
 
-## What's done so far
+## 2. Project structure
 
-**Phase 0 – Setup**  
-- **Schema**: Common types (`Chunk`, `RetrievalResult`, `RouterDecision`) so every retriever and router speaks the same format.  
-- **Retrievers**: Pluggable interface (`BaseRetriever`) and four stubs: BM25 (`general`), vector (`technical`), SQL (`structured`), code (`code`), plus a registry.  
-- **Baseline RAG**: Query one or more retrievers, get back chunks with latency/cost.  
-- **Config**: `config/indexes.yaml`, `config/router_actions.yaml` (five actions: BM25 only, vector only, SQL only, vector+BM25, code+vector).
-
-**Phase 1 – Rules-based router**  
-- **Keyword router**: Regex rules (e.g. SQL → structured retriever, code patterns → code+vector).  
-- **Centroid router**: Optional embedding similarity to per-action centroids (from `data/processed/centroids.json`); build centroids with `scripts/build_centroids.py`.  
-- **Combined router**: Keyword first; when no SQL/code match, fall back to centroid (or default).  
-- **Re-ranker**: Merge results from multiple retrievers with RRF (reciprocal rank fusion) in `src/rag/reranker.py`.  
-- **Pipeline**: `RAGPipeline(router=...)` runs route → log decision + latency → retrieve → re-rank when multi-index.  
-- **Logging**: Router decisions to `router_log.jsonl`, user feedback to `feedback_log.jsonl` (for Phase 2 labels and Phase 3 bandit).  
-- **Scripts**: `phase1_collect_labels.py` (run router + log; optional `--offline-eval` to try all actions and write `routing_labels.jsonl` with best action per query).
-
-**Phase 2 – Supervised transformer router**  
-- **Model**: Small encoder (default DistilBERT) + classification head → action id; checkpoint = `router_config.json`, `model.pt`, `tokenizer/`.  
-- **Training**: Load `routing_labels.jsonl`, cross-entropy training, validation top-1 accuracy, save checkpoint.  
-- **Inference**: `load_router(checkpoint_dir)` returns a `LearnedRouter` that can replace the rules router in the pipeline.  
-- **Script**: `phase2_train_router.py` (uses labels from Phase 1 `--offline-eval`).
-
-**Phase 3 – Bandit / RL**  
-- **LinUCB**: Contextual bandit (context = query embedding + cost/latency prefs); select by UCB, update with (context, action, reward).  
-- **Epsilon-greedy**: With prob ε random action, else use base router (e.g. learned).  
-- **REINFORCE**: Policy gradient over the transformer router; sample action from softmax, update with reward × grad(log π). Supports online (update after route) and replay (update from `feedback_log.jsonl` via re-forward for log_prob).  
-- **BanditRouter**: Single `BaseRouter` with `strategy=linucb|epsilon_greedy|reinforce`; `route(query)` and `update(query, decision, reward)` or `update_from_log_entry(query, action_id, reward)`.  
-- **OPE**: `mean_reward_from_log`, `evaluate_policy_on_log` in `src/router/bandit/ope.py`.  
-- **Script**: `phase3_bandit_online.py --strategy linucb|epsilon_greedy|reinforce --mode online|replay` (replay updates from `feedback_log.jsonl`; optional `--save` for REINFORCE).
-
-**Phase 4 – Evaluation and ablations**  
-- **Eval set**: JSONL with `query`, optional `query_id`, `reference_answer`, `gold_doc_ids`; `load_eval_set()` in `src/evaluation/eval_set.py`.  
-- **Metrics**: Retrieval (Hit@5, MRR), answer (EM, F1), system (avg latency, cost, avg chunks); existing helpers in `retrieval_metrics`, `answer_metrics`, `system_metrics`.  
-- **run_ablations()**: Run one or more strategies (baseline, rules, learned, bandit_linucb, bandit_epsilon, bandit_reinforce) on the eval set, aggregate metrics, return table rows.  
-- **format_table()**: Text table of strategy vs metrics.  
-- **Script**: `phase4_run_eval.py --eval-set data/labels/eval_set.jsonl --checkpoint checkpoints/router`; optional `--strategies`, `--output`, `--format table|csv|json`.
-
-**Implemented (optional)**  
-- **Phase 0 index build**: `scripts/phase0_build_indexes.py` builds BM25 (rank_bm25), vector (sentence-transformers), DuckDB, and code indexes from `data/raw/*.jsonl` or `*.txt`; retrievers load from `data/processed/`.  
-- **Pipeline LLM**: Pass `llm_client(query, context)` to `RAGPipeline`, or set `OPENAI_API_KEY` to use OpenAI; prompt built in `src/rag/llm.py`.
+```text
+.
+├── config/           # Settings, index definitions, router actions
+├── data/
+│   ├── raw/          # Input data (JSONL / txt)        (gitignored by default)
+│   ├── processed/    # Built indexes & logs            (gitignored; .gitkeep only)
+│   └── labels/       # Query sets, routing labels, eval sets
+├── notebooks/        # Exploration & analysis
+├── scripts/          # Phase entrypoints (0–4)
+├── src/
+│   ├── api/          # Optional FastAPI-style service
+│   ├── evaluation/   # Retrieval, answer & system metrics, ablations
+│   ├── logging/      # Router & feedback logging helpers
+│   ├── rag/          # Core RAG pipeline, LLM wrapper, reranker
+│   ├── retrievers/   # BM25, vector, SQL, code, index builder
+│   ├── router/       # Rules, learned and bandit routers
+│   └── schema/       # Shared types (Chunk, RetrievalResult, RouterDecision)
+├── tests/            # Unit tests
+├── run.py            # Simple CLI demo entrypoint
+├── requirements.txt
+└── pyproject.toml
+```
 
 ---
 
-## Phases (overview)
+## 3. Getting started
 
-- **Phase 0**: Setup data and indexes (pluggable retrievers, common schema, baseline RAG)
-- **Phase 1**: Rules-based router baseline (keywords, centroids, logging)
-- **Phase 2**: Supervised transformer router
-- **Phase 3**: Bandit/RL optimization from online feedback
-- **Phase 4**: Evaluation and ablations
+### 3.1 Prerequisites
 
-## Structure
+- Python **3.10+**
+- Git
+- (Optional) OpenAI API key for answer generation
 
-- `config/` — Settings, index definitions, router actions
-- `data/` — Raw data, processed chunks, labels
-- `src/` — Schema, retrievers, RAG pipeline, router (rules/learned/bandit), logging, evaluation, API
-- `scripts/` — Phase entrypoints
-- `tests/` — Unit tests
-- `notebooks/` — Exploration and analysis
-
-## Setup
+### 3.2 Installation
 
 ```bash
+git clone https://github.com/Sharanpazhanivel/Multi-Index-Rag.git
+cd Multi-Index-Rag
+
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+
 pip install -r requirements.txt
-cp .env.example .env  # set OPENAI_API_KEY for pipeline answer generation
 ```
 
-## Run
+### 3.3 Environment
 
-- Build indexes (Phase 0): `python scripts/phase0_build_indexes.py` (reads `data/raw/*.jsonl` or `*.txt`; writes to `data/processed/`. If raw missing, builds sample indexes.)
-- Collect labels: `python scripts/phase1_collect_labels.py` (optional `--offline-eval` for routing labels)
-- Train router (Phase 2): `python scripts/phase2_train_router.py` (requires `data/labels/routing_labels.jsonl`)
-- Load learned router: `from src.router.learned import load_router; router = load_router("checkpoints/router")`
-- Bandit (Phase 3): `python scripts/phase3_bandit_online.py --strategy linucb --mode replay` (or `reinforce` with `--checkpoint checkpoints/router`; use `--save` to write updated policy). Online: `--mode online --queries data/labels/queries.jsonl`.
-- Run eval (Phase 4): `python scripts/phase4_run_eval.py` (uses `data/labels/eval_set.jsonl`; create with query, optional reference_answer, gold_doc_ids). Optional: `--output results.txt`, `--format csv|json`.
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` and set:
+
+```text
+OPENAI_API_KEY=your_key_here
+```
+
+`.env` is **gitignored** and never pushed.
+
+---
+
+## 4. Running the demo (single query)
+
+The easiest way to see the system end-to-end:
+
+```bash
+python run.py
+```
+
+The script will:
+
+1. Build simple sample indexes (if `data/raw` is empty) using BM25, vector, SQL, and code retrievers.  
+2. Route your query through the current router (rules / learned / bandit).  
+3. Retrieve, re-rank, and (optionally) call the LLM to generate an answer.  
+4. Ask you whether the answer was helpful and log feedback to `data/processed/feedback_log.jsonl`.
+
+---
+
+## 5. Working with the phases
+
+### 5.1 Phase 0 – Setup & index build
+
+- Common schema types: `Chunk`, `RetrievalResult`, `RouterDecision`.
+- Pluggable retriever interface (`BaseRetriever`) with BM25 (`general`), vector (`technical`), SQL (`structured`), and code (`code`) retrievers.
+- Baseline RAG pipeline for querying one or more retrievers.
+- Index and action configuration in:
+  - `config/indexes.yaml`
+  - `config/router_actions.yaml` (e.g. BM25-only, vector-only, SQL-only, vector+BM25, code+vector).
+
+Build indexes:
+
+```bash
+python scripts/phase0_build_indexes.py
+```
+
+This reads from `data/raw/*.jsonl` / `*.txt` and writes indexes to `data/processed/`.
+
+### 5.2 Phase 1 – Rules-based router
+
+- **Keyword router**: Regex-based rules to route SQL-like questions to the structured retriever, code questions to code+vector, etc.
+- **Centroid router**: Embedding similarity to per-action centroids (built via `scripts/build_centroids.py`).
+- **Combined router**: Keyword first; falls back to centroid / default for ambiguous queries.
+- **Re-ranker**: Reciprocal rank fusion (RRF) across multiple retrievers in `src/rag/reranker.py`.
+- **Logging**: Router decisions to `router_log.jsonl`, user feedback to `feedback_log.jsonl`.
+
+Collect labels and logs:
+
+```bash
+python scripts/phase1_collect_labels.py \
+  --queries data/labels/queries.jsonl \
+  --offline-eval        # optional; creates routing_labels.jsonl
+```
+
+### 5.3 Phase 2 – Learned (transformer) router
+
+- Small encoder (default **DistilBERT**) + classification head → action id.
+- Checkpoint layout: `router_config.json`, `model.pt`, `tokenizer/`.
+- Training uses `routing_labels.jsonl` from Phase 1.
+
+Train:
+
+```bash
+python scripts/phase2_train_router.py \
+  --labels data/labels/routing_labels.jsonl \
+  --out-dir checkpoints/router
+```
+
+Load in code:
+
+```python
+from src.router.learned import load_router
+
+router = load_router("checkpoints/router")
+```
+
+Then plug into `RAGPipeline(router=router)`.
+
+### 5.4 Phase 3 – Bandit / RL
+
+- **LinUCB** contextual bandit (query embedding + cost/latency prefs).
+- **Epsilon-greedy** exploration on top of a base router (e.g. learned).
+- **REINFORCE** policy gradient over the transformer router; supports online updates and replay from logs.
+- **BanditRouter** wrapper (`strategy=linucb|epsilon_greedy|reinforce`) with:
+  - `route(query)`
+  - `update(query, decision, reward)` or `update_from_log_entry(...)`.
+- **OPE helpers** in `src/router/bandit/ope.py`.
+
+Run bandit training / replay:
+
+```bash
+python scripts/phase3_bandit_online.py \
+  --strategy linucb \
+  --mode replay \
+  --feedback-log data/processed/feedback_log.jsonl
+```
+
+### 5.5 Phase 4 – Evaluation & ablations
+
+- Eval set stored as JSONL with `query`, optional `query_id`, `reference_answer`, `gold_doc_ids`.
+- Metrics:
+  - Retrieval: Hit@k, MRR
+  - Answer: EM, F1
+  - System: avg latency, cost, number of chunks
+- Ablations runner: `run_ablations()` and `format_table()` in `src/evaluation`.
+
+Run evaluation:
+
+```bash
+python scripts/phase4_run_eval.py \
+  --eval-set data/labels/eval_set.jsonl \
+  --checkpoint checkpoints/router \
+  --output results.txt \
+  --format table
+```
+
+---
+
+## 6. Status
+
+Implemented:
+
+- ✅ Index build for BM25 / vector / SQL / code
+- ✅ Rules-based router + logging
+- ✅ Supervised transformer router (training + inference)
+- ✅ Bandit / RL router (LinUCB, epsilon-greedy, REINFORCE) with OPE
+- ✅ Evaluation utilities and phase scripts
+- ✅ Simple CLI (`run.py`) to try everything with a single query
+
+If you use this project or extend it (e.g., new retrievers, reward functions, or routers), feel free to open an issue or PR. :)
